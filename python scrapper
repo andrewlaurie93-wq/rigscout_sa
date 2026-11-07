@@ -1,0 +1,149 @@
+import os
+import re
+import time
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+import requests
+from supabase import create_client, Client
+
+# --- Supabase Configuration ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variable.")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- Forum Endpoints ---
+# Replace or add actual forum classified section URLs
+FORUM_SECTIONS = [
+    {"category": "GPUs", "url": "https://carbonite.co.za/index.php?forums/graphics-cards.20/"},
+    {"category": "CPUs", "url": "https://carbonite.co.za/index.php?forums/processors.17/"},
+]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-ZA,en;q=0.9",
+}
+
+
+def parse_zar_price(text: str) -> int | None:
+    """Extract integer price from strings like 'R5,500', 'R 5500', or '5500 ZAR'."""
+    if not text:
+        return None
+    # Remove spaces and commas
+    cleaned = text.replace(",", "").replace(" ", "")
+    # Search for R followed by numbers or standalone price mentions
+    match = re.search(r"R(\d{3,6})(?:\.\d{1,2})?", cleaned, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def scrape_forum_section(url: str, category: str) -> list[dict]:
+    """Fetch and parse threads from a XenForo forum page."""
+    print(f"[*] Scraping {category} from: {url}")
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=12)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[!] Request failed for {url}: {e}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    listings = []
+
+    # XenForo threads are typically wrapped in .structItem--thread
+    threads = soup.select(".structItem--thread")
+
+    for thread in threads:
+        title_tag = thread.select_one(".structItem-title a:last-of-type")
+        if not title_tag:
+            continue
+
+        raw_title = title_tag.get_text(strip=True)
+        prefix_tag = thread.select_one(".structItem-title .label")
+        prefix = prefix_tag.get_text(strip=True) if prefix_tag else ""
+
+        full_title_text = f"{prefix} {raw_title}".strip()
+
+        # Filter strictly for "[For Sale]" or "Sale" threads
+        if not re.search(r"\[?(?:for\s+sale|sale)\]?", full_title_text, re.IGNORECASE):
+            continue
+        
+        # Skip sold, wanted, or closed items
+        if re.search(r"\[?(?:sold|closed|wanted)\]?", full_title_text, re.IGNORECASE):
+            continue
+
+        relative_link = title_tag.get("href", "")
+        listing_url = urljoin(url, relative_link)
+
+        # Snippet or teaser often contains the price or specs
+        snippet_tag = thread.select_one(".structItem-snippet")
+        snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+
+        # Price check first in title, then in the snippet preview
+        price_zar = parse_zar_price(raw_title) or parse_zar_price(snippet)
+
+        # Seller name and post date
+        seller_tag = thread.select_one(".username, [data-author]")
+        seller = seller_tag.get_text(strip=True) if seller_tag else "Classified Seller"
+
+        time_tag = thread.select_one("time.u-dt")
+        posted_at = (
+            time_tag.get("datetime")
+            if time_tag and time_tag.get("datetime")
+            else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        )
+
+        listings.append({
+            "title": raw_title,
+            "category": category,
+            "price_zar": price_zar,
+            "currency": "ZAR",
+            "source": "Carbonite",
+            "seller": seller,
+            "listing_url": listing_url,
+            "posted_at": posted_at,
+        })
+
+    print(f"[+] Found {len(listings)} '[For Sale]' threads in {category}.")
+    return listings
+
+
+def save_to_supabase(listings: list[dict]):
+    """Upsert records into the Supabase 'listings' table on listing_url."""
+    if not listings:
+        print("[!] No listings to insert.")
+        return
+
+    print(f"[*] Upserting {len(listings)} listings into Supabase...")
+    try:
+        response = (
+            supabase.table("listings")
+            .upsert(listings, on_conflict="listing_url")
+            .execute()
+        )
+        print(f"[✓] Successfully saved {len(response.data)} listings to Supabase!")
+    except Exception as e:
+        print(f"[!] Error saving to Supabase: {e}")
+
+
+def main():
+    all_scraped = []
+
+    for section in FORUM_SECTIONS:
+        items = scrape_forum_section(section["url"], section["category"])
+        all_scraped.extend(items)
+        time.sleep(2)  # Polite delay between requests
+
+    save_to_supabase(all_scraped)
+
+
+if __name__ == "__main__":
+    main()
